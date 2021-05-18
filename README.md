@@ -1,6 +1,4 @@
-# This is the code for the paper "Fully Convolutional Recurrent Networks for Multidate Crop Recognition from Multitemporal Image Sequence"
-
-This is a first version which will be optimized soon.
+# This is the code for the paper "3D Convolution for Multidate Crop Recognition from Multitemporal Image Sequences"
 
 ## Installing the required python packages
 
