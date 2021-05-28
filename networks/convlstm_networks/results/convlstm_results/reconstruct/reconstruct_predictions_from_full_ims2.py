@@ -23,6 +23,7 @@ model_type=a.model_type
 
 dataset='cv'
 model_type='unet'
+skip_crf=True
 
 def dense_crf(probs, img=None, n_iters=10, n_classes=19,
 			  sxy_gaussian=(1, 1), compat_gaussian=4,
@@ -230,13 +231,14 @@ for m in range(patch_size//2,row-patch_size//2,stride):
 			pred_cl = model.predict(patch)
 
 			print(pred_cl[0].shape)
-			for i,v in enumerate(pred_cl[0]):
-				img_in = patch[0][i]
-				img_in = np.array(img_in, dtype=np.uint8)
-				img_in = np.expand_dims(img_in, axis=0)
-				v = scipy.special.softmax(v, axis=-1)
-				v = np.expand_dims(v, axis=0)
-				pred_cl[0][i] = dense_crf(v,img=img_in,n_iters=10,sxy_gaussian=(3, 3), compat_gaussian=3,n_classes=class_n)
+			if not skip_crf:
+				for i,v in enumerate(pred_cl[0]):
+					img_in = patch[0][i]
+					img_in = np.array(img_in, dtype=np.uint8)
+					img_in = np.expand_dims(img_in, axis=0)
+					v = scipy.special.softmax(v, axis=-1)
+					v = np.expand_dims(v, axis=0)
+					pred_cl[0][i] = dense_crf(v,img=img_in,n_iters=10,sxy_gaussian=(3, 3), compat_gaussian=3,n_classes=class_n)
 
 			_, _, x, y, _ = pred_cl.shape
 
