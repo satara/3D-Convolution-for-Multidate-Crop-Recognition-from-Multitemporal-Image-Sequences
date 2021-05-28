@@ -1,14 +1,16 @@
 from utils import *
 from keras.layers import Input, Dense, Conv2D, MaxPool2D, Flatten, Dropout, Conv2DTranspose
 # from keras.callbacks import ModelCheckpoint , EarlyStopping
-from keras.optimizers import Adam,Adagrad 
+from keras.optimizers import Adam,Adagrad
 from keras.models import Model
 from keras import backend as K
 import keras
+#from tensorflow.keras import backend
 
 import numpy as np
 from sklearn.utils import shuffle
 import cv2
+from skimage.util import view_as_windows
 import argparse
 import tensorflow as tf
 
@@ -26,19 +28,21 @@ from densnet_timedistributed import DenseNetFCNTimeDistributed
 
 from metrics import fmeasure,categorical_accuracy
 import deb
-from keras_weighted_categorical_crossentropy import weighted_categorical_crossentropy, sparse_accuracy_ignoring_last_label, weighted_categorical_crossentropy_ignoring_last_label
+from keras_weighted_categorical_crossentropy import weighted_categorical_crossentropy, sparse_accuracy_ignoring_last_label, weighted_categorical_crossentropy_ignoring_last_label, categorical_focal_ignoring_last_label, weighted_categorical_focal_ignoring_last_label
 from keras.models import load_model
-from keras.layers import ConvLSTM2D, UpSampling2D, multiply
+from keras.layers import ConvLSTM2D, UpSampling2D, multiply #, ConvGRU2D
 from keras.utils.vis_utils import plot_model
 from keras.regularizers import l1,l2
 import time
 import pickle
 import pdb
+import pathlib
+from patches_handler import PatchesArray
 parser = argparse.ArgumentParser(description='')
 parser.add_argument('-tl', '--t_len', dest='t_len',
 					type=int, default=7, help='t len')
 parser.add_argument('-cn', '--class_n', dest='class_n',
-					type=int, default=11, help='class_n')
+					type=int, default=12, help='class_n')
 parser.add_argument('-chn', '--channel_n', dest='channel_n',
 					type=int, default=2, help='channel number')
 
@@ -57,9 +61,9 @@ parser.add_argument('-pt', '--patience', dest='patience',
 					type=int, default=10, help='patience')
 
 parser.add_argument('-bstr', '--batch_size_train', dest='batch_size_train',
-					type=int, default=32, help='patch len')
+					type=int, default=16, help='patch len')
 parser.add_argument('-bsts', '--batch_size_test', dest='batch_size_test',
-					type=int, default=32, help='patch len')
+					type=int, default=16, help='patch len')
 
 parser.add_argument('-em', '--eval_mode', dest='eval_mode',
 					default='metrics', help='Test evaluate mode: metrics or predict')
@@ -72,6 +76,9 @@ parser.add_argument('-path', '--path', dest='path',
 					default='../data/', help='Experiment id')
 parser.add_argument('-mdl', '--model_type', dest='model_type',
 					default='DenseNet', help='Experiment id')
+parser.add_argument('-ste', '--stop_epoch', dest='stop_epoch',
+					type=int, default=-1, help='Stop epoch. If 0, no fixed stop epoch.')
+
 
 
 args = parser.parse_args()
@@ -80,6 +87,24 @@ if args.patch_step_test==None:
 	args.patch_step_test=args.patch_len
 
 deb.prints(args.patch_step_test)
+
+
+#========= overwrite for direct execution of this py file
+args.stop_epoch=-1
+dataset = 'cv'
+
+if dataset == 'lem':
+	args.path="../../../dataset/dataset/lm_data/"
+	args.t_len=13
+	args.class_n=15
+else:
+	args.path="../../../dataset/dataset/cv_data/"
+	args.t_len=14
+	args.class_n=12
+
+args.chanel_n=2
+args.model_type='BUnet4ConvLSTM'
+
 
 def model_summary_print(s):
 	with open('model_summary.txt','w+') as f:
@@ -92,6 +117,15 @@ def txt_append(filename, append_text):
 def load_obj(name ):
 	with open('obj/' + name + '.pkl', 'rb') as f:
 		return pickle.load(f)
+
+def sizeof_fmt(num, suffix='B'):
+    ''' by Fred Cirera,  https://stackoverflow.com/a/1094933/1870254, modified'''
+    for unit in ['','Ki','Mi','Gi','Ti','Pi','Ei','Zi']:
+        if abs(num) < 1024.0:
+            return "%3.1f %s%s" % (num, unit, suffix)
+        num /= 1024.0
+    return "%.1f %s%s" % (num, 'Yi', suffix)
+
 # ================= Generic class for init values =============================================== #
 class NetObject(object):
 
@@ -103,11 +137,21 @@ class NetObject(object):
 		self.patches = {'train': {}, 'test': {}}
 
 		self.patches['train']['step']=patch_step_train
-		self.patches['test']['step']=patch_step_test        
+		self.patches['test']['step']=patch_step_test
+
 		self.path['train']['in'] = path + 'train_test/train/ims/'
 		self.path['test']['in'] = path + 'train_test/test/ims/'
 		self.path['train']['label'] = path + 'train_test/train/labels/'
 		self.path['test']['label'] = path + 'train_test/test/labels/'
+
+		# in these paths, the augmented train set and validation set are stored
+		# they can be loaded after (flag decides whether estimating these values and storing,
+		# or loading the precomputed ones)
+		self.path_patches_bckndfixed = path + 'patches_bckndfixed/'
+		self.path['train_bckndfixed']=self.path_patches_bckndfixed+'train/'
+		self.path['val_bckndfixed']=self.path_patches_bckndfixed+'val/'
+		self.path['test_bckndfixed']=self.path_patches_bckndfixed+'test/'
+
 		self.channel_n = channel_n
 		self.debug = debug
 		self.class_n = class_n
@@ -117,7 +161,7 @@ class NetObject(object):
 		self.report['best']['text_path']='../results/'+self.report['best']['text_name']
 		self.report['best']['text_history_path']='../results/'+'history.txt'
 		self.report['val']['history_path']='../results/'+'history_val.txt'
-		
+
 		self.t_len=t_len
 
 # ================= Dataset class implements data loading, patch extraction, metric calculation and image reconstruction =======#
@@ -155,7 +199,7 @@ class Dataset(NetObject):
 		#self.patches_list['test']['ims']=glob.glob(self.path['test']['in']+'*.npy')
 		#self.patches_list['test']['label']=glob.glob(self.path['test']['label']+'*.npy')
 		self.patches['test']['label'],self.patches_list['test']['label']=self.folder_load(self.path['test']['label'])
-		
+
 		self.patches['train']['in'],self.patches_list['train']['ims']=self.folder_load(self.path['train']['in'])
 		self.patches['train']['label'],self.patches_list['train']['label']=self.folder_load(self.path['train']['label'])
 		self.patches['test']['in'],self.patches_list['test']['ims']=self.folder_load(self.path['test']['in'])
@@ -177,16 +221,16 @@ class Dataset(NetObject):
 
 		self.patches['train']['label']=self.patches['train']['label'].astype(np.int8)
 		self.patches['test']['label']=self.patches['test']['label'].astype(np.int8)
-		
+
 		deb.prints(len(self.patches_list['test']['label']))
 		deb.prints(len(self.patches_list['test']['ims']))
 		deb.prints(self.patches['train']['in'].shape)
 		deb.prints(self.patches['train']['in'].dtype)
-		
+
 		deb.prints(self.patches['train']['label'].shape)
 		deb.prints(self.patches['test']['label'].shape)
 		unique,count = np.unique(self.patches['test']['label'],return_counts=True)
-		print_pixel_count = True
+		print_pixel_count = False
 		if print_pixel_count == True:
 			for t_step in range(self.patches['test']['label'].shape[1]):
 				deb.prints(t_step)
@@ -197,7 +241,7 @@ class Dataset(NetObject):
 				deb.prints(t_step)
 				deb.prints(np.unique(self.patches['test']['label'].argmax(axis=-1)[:,t_step],return_counts=True))
 			#pdb.set_trace()
-		
+
 		self.patches['train']['n']=self.patches['train']['in'].shape[0]
 		self.patches['train']['idx']=range(self.patches['train']['n'])
 		np.save('labels_beginning.npy',self.patches['test']['label'])
@@ -210,7 +254,7 @@ class Dataset(NetObject):
 			im_one_hot[:,:,:,:,clss][im[:,:,:,:]==clss]=1
 		return im_one_hot
 
-	def folder_load(self,folder_path):
+	def folder_load(self,folder_path): #move to patches_handler
 		paths=glob.glob(folder_path+'*.npy')
 		files=[]
 		deb.prints(len(paths))
@@ -293,6 +337,22 @@ class Dataset(NetObject):
 		out = np.reshape(out, (out.shape[0] * out.shape[1],) + out.shape[2::])
 		return out,partitioned_shape
 
+#=============== PATCHES STORE ==========================#
+
+	def patchesStore(self, patches, split='train_bckndfixed'):
+		pathlib.Path(self.path[split]).mkdir(parents=True, exist_ok=True)
+		np.save(self.path[split]+'patches_in.npy', patches['in']) #to-do: add polymorphism for other types of input
+
+		#pathlib.Path(self.path[split]['label']).mkdir(parents=True, exist_ok=True)
+		np.save(self.path[split]+'patches_label.npy', patches['label']) #to-do: add polymorphism for other types of input
+
+	def patchesLoad(self, split='train'):
+		out={}
+		out['in']=np.load(self.path[split]+'patches_in.npy',mmap_mode='r')
+		out['label']=np.load(self.path[split]+'patches_label.npy')
+		return out
+
+
 #=============== METRICS CALCULATION ====================#
 	def ims_flatten(self,ims):
 		return np.reshape(ims,(np.prod(ims.shape[0:-1]),ims.shape[-1]))
@@ -345,11 +405,11 @@ class Dataset(NetObject):
 		class_n=data['prediction'].shape[-1]
 		#print("label unque at start of metrics_get",
 		#	np.unique(data['label'].argmax(axis=4),return_counts=True))
-		
+
 
 		#data['label'][data['label'][:,],:,:,:,:]
 		#data['label_copy']=data['label_copy'][:,:,:,:,:-1] # Eliminate bcknd dimension after having eliminated bcknd samples
-		
+
 		#print("label_copy unque at start of metrics_get",
 	#		np.unique(data['label_copy'].argmax(axis=4),return_counts=True))
 		deb.prints(data['prediction'].shape,debug,2)
@@ -362,10 +422,10 @@ class Dataset(NetObject):
 
 		data['prediction_h']=self.probabilities_to_one_hot(data['prediction_h'])
 		deb.prints(data['prediction_h'].shape,debug,2)
-				
+
 		data['label_h'] = self.ims_flatten(data['label']) #(self.batch['test']['size']*self.patch_len*self.patch_len,self.class_n
 		deb.prints(data['label'].shape,debug,2)
-		
+
 		data['label_h_int']=data['label_h'].argmax(axis=1)
 		data['prediction_h_int']=data['prediction_h'].argmax(axis=1)
 
@@ -377,7 +437,7 @@ class Dataset(NetObject):
 		print("After passing to int then to onehot")
 		deb.prints(data['label_h'].shape,debug,2)
 		deb.prints(data['prediction_h'].shape,debug,2)
-				
+
 		ignore_bcknd=False
 		if ignore_bcknd==True:
 			data['prediction_h']=data['prediction_h'][:,1:]
@@ -390,14 +450,14 @@ class Dataset(NetObject):
 			#data['prediction_h']=data['prediction_h'][:,data['prediction_h']!=0]
 			data['prediction_h']=data['prediction_h'][~np.all(data['label_h'] == 0, axis=1)]
 			data['label_h']=data['label_h'][~np.all(data['label_h'] == 0, axis=1)]
-			
+
 			#for row in range(0,data['label_h'].shape[0]):
 			#	if np.sum(data['label_h'][row,:])==0:
 			#		np.delete(data['label_h'],row,0)
 			#		np.delete(data['prediction_h'],row,0)
 
 
-		if debug>=1: 
+		if debug>=1:
 			deb.prints(data['prediction_h'].dtype)
 			deb.prints(data['label_h'].dtype)
 			deb.prints(data['prediction_h'].shape)
@@ -410,24 +470,24 @@ class Dataset(NetObject):
 		print("Metric real unique+1,count",unique+1,count)
 		unique,count=np.unique(data['prediction_h'].argmax(axis=1),return_counts=True)
 		print("Metric prediction unique+1,count",unique+1,count)
-		
+
 		#========================METRICS GET================================================#
 		metrics={}
 		metrics['f1_score']=f1_score(data['label_h'],data['prediction_h'],average='macro')
 		metrics['f1_score_weighted']=f1_score(data['label_h'],data['prediction_h'],average='weighted')
-		
+
 		metrics['overall_acc']=accuracy_score(data['label_h'],data['prediction_h'])
 		metrics['confusion_matrix']=confusion_matrix(data['label_h'].argmax(axis=1),data['prediction_h'].argmax(axis=1))
 		metrics['per_class_acc']=(metrics['confusion_matrix'].astype('float') / metrics['confusion_matrix'].sum(axis=1)[:, np.newaxis]).diagonal()
-		
+
 		metrics['average_acc']=np.average(metrics['per_class_acc'][~np.isnan(metrics['per_class_acc'])])
 
-		
+
 		#=====================IMG RECONSTRUCT============================================#
 		if False==True:
 			data_label_reconstructed=self.flattened_to_im(data['label_h'],data['label'].shape)
 			data_prediction_reconstructed=self.flattened_to_im(data['prediction_h'],data['label'].shape)
-		
+
 			deb.prints(data_label_reconstructed.shape)
 			np.testing.assert_almost_equal(data['label'],data_label_reconstructed)
 			print("Is label reconstructed equal to original",np.array_equal(data['label'],data_label_reconstructed))
@@ -477,8 +537,8 @@ class Dataset(NetObject):
 					str(metrics['per_class_acc'][0]),str(metrics['per_class_acc'][1]),str(metrics['per_class_acc'][2]),
 					str(metrics['per_class_acc'][3]),str(metrics['per_class_acc'][4]),str(metrics['per_class_acc'][5]),
 					str(metrics['per_class_acc'][6]),str(metrics['per_class_acc'][7])))
-				
-			
+
+
 	def metrics_per_class_from_im_get(self,name='im_reconstructed_rgb_test_predictionplen64_3.png',folder='../results/reconstructed/',average=None):
 		data={}
 		metrics={}
@@ -488,7 +548,7 @@ class Dataset(NetObject):
 
 		data['prediction']=np.reshape(data['prediction'],-1)
 		data['label']=np.reshape(data['label'],-1)
-		
+
 		metrics['f1_score_per_class']=f1_score(data['prediction'],data['label'],average=average)
 		print(metrics)
 
@@ -499,7 +559,7 @@ class Dataset(NetObject):
 		h,w,_=self.image[subset]['label'].shape
 		print(self.patches[subset]['label_partitioned_shape'])
 		deb.prints(self.patches[subset][mode].shape)
-		
+
 		h_blocks,w_blocks,patch_len,_=self.patches[subset]['label_partitioned_shape']
 
 		patches_block=np.reshape(self.patches[subset][mode].argmax(axis=3),(h_blocks,w_blocks,patch_len,patch_len))
@@ -509,7 +569,7 @@ class Dataset(NetObject):
 
 		h_block_len=int(self.image[subset]['label'].shape[0]/h_blocks)
 		w_block_len=int(self.image[subset]['label'].shape[1]/w_blocks)
-		
+
 		count=0
 
 		for w_block in range(0,w_blocks):
@@ -517,13 +577,13 @@ class Dataset(NetObject):
 				y=int(h_block*h_block_len)
 				x=int(w_block*w_block_len)
 				#print(y)
-				#print(x)				
+				#print(x)
 				#deb.prints([y:y+self.patch_len])
 				self.im_reconstructed[y:y+self.patch_len,x:x+self.patch_len]=patches_block[h_block,w_block,:,:]
 				count+=1
 
 		self.im_reconstructed_rgb=self.im_gray_idx_to_rgb(self.im_reconstructed)
-		if self.debug>=3: 
+		if self.debug>=3:
 			deb.prints(count)
 			deb.prints(self.im_reconstructed_rgb.shape)
 
@@ -541,16 +601,16 @@ class Dataset(NetObject):
 		clss_train_unique,clss_train_count=np.unique(self.patches['train']['label'].argmax(axis=4),return_counts=True)
 		deb.prints(clss_train_count)
 		self.patches['val']={'n':int(self.patches['train']['n']*validation_split)}
-		
+
 		#===== CHOOSE VAL IDX
 		#mode='stratified'
 		if mode=='random':
 			self.patches['val']['idx']=np.random.choice(self.patches['train']['idx'],self.patches['val']['n'],replace=False)
-			
+
 
 			self.patches['val']['in']=self.patches['train']['in'][self.patches['val']['idx']]
 			self.patches['val']['label']=self.patches['train']['label'][self.patches['val']['idx']]
-		
+
 		elif mode=='stratified':
 			# self.patches['train']['in'] are the input sequences of images of shape (val_sample_n,t_len,h,w,channel_n)
 			# self.patches['train']['label'] is the ground truth of shape (sample_n,t_len,h,w,class_n)
@@ -561,7 +621,7 @@ class Dataset(NetObject):
 				self.patches['val']['idx']=np.random.choice(self.patches['train']['idx'],self.patches['val']['n'],replace=False)
 				self.patches['val']['in']=self.patches['train']['in'][self.patches['val']['idx']]
 				self.patches['val']['label']=self.patches['train']['label'][self.patches['val']['idx']]
-		
+
 				clss_val_unique,clss_val_count=np.unique(self.patches['val']['label'].argmax(axis=4),return_counts=True)
 
 				# If validation set doesn't contain ALL classes from train set, repeat random choice
@@ -576,7 +636,7 @@ class Dataset(NetObject):
 					# Percentage for each class is equal to: (validation sample number)/(train sample number)*100
 					# If percentage from any class is larger than 20% repeat random choice
 					if np.any(percentages>0.2):
-					
+
 						pass
 					else:
 						# Else keep the validation set
@@ -584,12 +644,12 @@ class Dataset(NetObject):
 		elif mode=='random_v2':
 			while True:
 
-				self.patches['val']['idx']=np.random.choice(self.patches['train']['idx'],self.patches['val']['n'],replace=False)				
+				self.patches['val']['idx']=np.random.choice(self.patches['train']['idx'],self.patches['val']['n'],replace=False)
 
 				self.patches['val']['in']=self.patches['train']['in'][self.patches['val']['idx']]
 				self.patches['val']['label']=self.patches['train']['label'][self.patches['val']['idx']]
 				clss_val_unique,clss_val_count=np.unique(self.patches['val']['label'].argmax(axis=3),return_counts=True)
-						
+
 				deb.prints(clss_train_unique)
 				deb.prints(clss_val_unique)
 
@@ -603,21 +663,21 @@ class Dataset(NetObject):
 				if np.any(percentages>0.26):
 					pass
 				else:
-					break				
+					break
 
 		deb.prints(self.patches['val']['idx'].shape)
 
-		
+
 		deb.prints(self.patches['val']['in'].shape)
 		#deb.prints(data.patches['val']['label'].shape)
-		
+
 		self.patches['train']['in']=np.delete(self.patches['train']['in'],self.patches['val']['idx'],axis=0)
 		self.patches['train']['label']=np.delete(self.patches['train']['label'],self.patches['val']['idx'],axis=0)
 		#deb.prints(data.patches['train']['in'].shape)
 		#deb.prints(data.patches['train']['label'].shape)
 	def semantic_balance(self,samples_per_class=500): # samples mean sequence of patches. Keep
 		print("data.semantic_balance")
-		
+
 		# Count test
 		patch_count=np.zeros(self.class_n)
 
@@ -625,7 +685,7 @@ class Dataset(NetObject):
 			patch_count[clss]=np.count_nonzero(np.isin(self.patches['test']['label'].argmax(axis=4),clss).sum(axis=(1,2,3)))
 		deb.prints(patch_count.shape)
 		print("Test",patch_count)
-		
+
 		# Count train
 		patch_count=np.zeros(self.class_n)
 
@@ -633,7 +693,7 @@ class Dataset(NetObject):
 			patch_count[clss]=np.count_nonzero(np.isin(self.patches['train']['label'].argmax(axis=4),clss).sum(axis=(1,2,3)))
 		deb.prints(patch_count.shape)
 		print("Train",patch_count)
-		
+
 		# Start balancing
 		balance={}
 		balance["out_n"]=(self.class_n-1)*samples_per_class
@@ -674,14 +734,14 @@ class Dataset(NetObject):
 					augmented_labels = balance["label"]
 
 					cont_transf = 0
-					for i in range(int(samples_per_class/balance["label"].shape[0] - 1)):                
+					for i in range(int(samples_per_class/balance["label"].shape[0] - 1)):
 						augmented_data_temp = balance["in"]
 						augmented_label_temp = balance["label"]
-						
+
 						if cont_transf == 0:
 							augmented_data_temp = np.rot90(augmented_data_temp,1,(2,3))
 							augmented_label_temp = np.rot90(augmented_label_temp,1,(2,3))
-						
+
 						elif cont_transf == 1:
 							augmented_data_temp = np.rot90(augmented_data_temp,2,(2,3))
 							augmented_label_temp = np.rot90(augmented_label_temp,2,(2,3))
@@ -689,26 +749,26 @@ class Dataset(NetObject):
 						elif cont_transf == 2:
 							augmented_data_temp = np.flip(augmented_data_temp,2)
 							augmented_label_temp = np.flip(augmented_label_temp,2)
-							
+
 						elif cont_transf == 3:
 							augmented_data_temp = np.flip(augmented_data_temp,3)
 							augmented_label_temp = np.flip(augmented_label_temp,3)
-						
+
 						elif cont_transf == 4:
 							augmented_data_temp = np.rot90(augmented_data_temp,3,(2,3))
 							augmented_label_temp = np.rot90(augmented_label_temp,3,(2,3))
-							
+
 						elif cont_transf == 5:
 							augmented_data_temp = augmented_data_temp
 							augmented_label_temp = augmented_label_temp
-							
+
 						cont_transf+=1
 						if cont_transf==6:
 							cont_transf = 0
-						print(augmented_data.shape,augmented_data_temp.shape)				
+						print(augmented_data.shape,augmented_data_temp.shape)
 						augmented_data = np.vstack((augmented_data,augmented_data_temp))
 						augmented_labels = np.vstack((augmented_labels,augmented_label_temp))
-						
+
 		#            augmented_labels_temp = np.tile(clss_labels,samples_per_class/num_samples )
 					#print(augmented_data.shape)
 					#print(augmented_labels.shape)
@@ -724,7 +784,7 @@ class Dataset(NetObject):
 					balance["out_in"][k*samples_per_class:k*samples_per_class + samples_per_class] = balance["in"][index]
 
 			k+=1
-		
+
 		idx = np.random.permutation(balance["out_labels"].shape[0])
 		self.patches['train']['in'] = balance["out_in"][idx]
 		self.patches['train']['label'] = balance["out_labels"][idx]
@@ -734,7 +794,7 @@ class Dataset(NetObject):
 		#balance={}
 		#for clss in range(1,self.class_n):
 		#	balance["data"]=data["train"]["in"][]
-			
+
 
 		#train_flat=np.reshape(self.patches['train']['label'],(self.patches['train']['label'].shape[0],np.prod(self.patches['train']['label'].shape[1:])))
 		#deb.prints(train_flat.shape)
@@ -744,9 +804,9 @@ class Dataset(NetObject):
 # ========== NetModel object implements model graph definition, train/testing, early stopping ================ #
 
 class NetModel(NetObject):
-	def __init__(self, batch_size_train=32, batch_size_test=200, epochs=30000, 
+	def __init__(self, batch_size_train=32, batch_size_test=200, epochs=30000,
 		patience=10, eval_mode='metrics', val_set=True,
-		model_type='DenseNet', time_measure=False, *args, **kwargs):
+		model_type='DenseNet', time_measure=False, stop_epoch=0, *args, **kwargs):
 
 		super().__init__(*args, **kwargs)
 		if self.debug >= 1:
@@ -757,7 +817,7 @@ class NetModel(NetObject):
 		self.batch['train']['size'] = batch_size_train
 		self.batch['test']['size'] = batch_size_test
 		self.batch['val']['size'] = batch_size_test
-		
+
 		self.eval_mode = eval_mode
 		self.epochs = epochs
 		self.early_stop={'best':0,
@@ -774,6 +834,8 @@ class NetModel(NetObject):
 		self.model_save=True
 		self.time_measure=time_measure
 		self.mp=load_obj('model_params')
+		self.stop_epoch=stop_epoch
+		deb.prints(self.stop_epoch)
 	def transition_down(self, pipe, filters):
 		pipe = Conv2D(filters, (3, 3), strides=(2, 2), padding='same')(pipe)
 		pipe = keras.layers.BatchNormalization(axis=3)(pipe)
@@ -781,7 +843,7 @@ class NetModel(NetObject):
 		#pipe = Conv2D(filters, (1, 1), padding='same')(pipe)
 		#pipe = keras.layers.BatchNormalization(axis=3)(pipe)
 		#pipe = Activation('relu')(pipe)
-		
+
 		return pipe
 
 	def dense_block(self, pipe, filters):
@@ -812,7 +874,7 @@ class NetModel(NetObject):
 
 		#x = keras.layers.Permute((1,2,0,3))(in_im)
 		x = keras.layers.Permute((2,3,1,4))(in_im)
-		
+
 		x = Reshape((self.patch_len, self.patch_len,self.t_len*self.channel_n), name='predictions')(x)
 		#pipe = {'fwd': [], 'bckwd': []}
 		c = {'init_up': 0, 'up': 0}
@@ -824,12 +886,12 @@ class NetModel(NetObject):
 		pipe.append(self.transition_down(pipe[-1], filters*4))  # 2 4x4
 		pipe.append(self.transition_down(pipe[-1], filters*8))  # 2 4x4
 		c['down']=len(pipe)-1 # Last down-layer idx
-		
+
 		# =============== Dense block; no transition ================ #
 		#pipe.append(self.dense_block(pipe[-1], filters*16))  # 3 4x4
 
 		# =================== Transition Up ============================= #
-		c['up']=c['down'] # First up-layer idx 
+		c['up']=c['down'] # First up-layer idx
 		pipe.append(self.concatenate_transition_up(pipe[-1], pipe[c['up']], filters*8))  # 4 8x8
 		c['up']-=1
 		pipe.append(self.concatenate_transition_up(pipe[-1], pipe[c['up']], filters*4))  # 4 8x8
@@ -849,10 +911,10 @@ class NetModel(NetObject):
 
 		#x = keras.layers.Permute((1,2,0,3))(in_im)
 		x = keras.layers.Permute((2,3,1,4))(in_im)
-		
+
 		x = Reshape((self.patch_len, self.patch_len,self.t_len*self.channel_n), name='predictions')(x)
 		#pipe = {'fwd': [], 'bckwd': []}
-		
+
 
 		x = Conv2D(48, (3, 3), activation='relu',
 					 padding='same')(x)
@@ -867,12 +929,12 @@ class NetModel(NetObject):
 		pipe.append(self.transition_down(pipe[-1], filters*2))  # 1 8x8
 		#pipe.append(self.transition_down(pipe[-1], filters*4))  # 2 4x4
 		c['down']=len(pipe)-1 # Last down-layer idx
-		
+
 		# =============== Dense block; no transition ================ #
 		#pipe.append(self.dense_block(pipe[-1], filters*16))  # 3 4x4
 
 		# =================== Transition Up ============================= #
-		c['up']=c['down'] # First up-layer idx 
+		c['up']=c['down'] # First up-layer idx
 		#pipe.append(self.concatenate_transition_up(pipe[-1], pipe[c['up']], filters*4))  # 4 8x8
 		#c['up']-=1
 		pipe.append(self.concatenate_transition_up(pipe[-1], pipe[c['up']], filters*2))  # 5
@@ -895,15 +957,32 @@ class NetModel(NetObject):
 			x = BatchNormalization(gamma_regularizer=l2(weight_decay),
 							   beta_regularizer=l2(weight_decay))(x)
 			x = Activation('relu')(x)
-			return x		
-		def transpose_layer(x,filter_size,dilation_rate=1, 
+			return x
+		def dilated_layer_3D(x,filter_size,dilation_rate=1, kernel_size=3):
+			if isinstance(dilation_rate, int):
+				dilation_rate = (dilation_rate, dilation_rate, dilation_rate)
+			x = Conv3D(filter_size, kernel_size, padding='same',
+				dilation_rate=dilation_rate)(x)
+			x = BatchNormalization(gamma_regularizer=l2(weight_decay),
+							   beta_regularizer=l2(weight_decay))(x)
+			x = Activation('relu')(x)
+			return x
+		def transpose_layer(x,filter_size,dilation_rate=1,
 			kernel_size=3, strides=(2,2)):
-			x = TimeDistributed(Conv2DTranspose(filter_size, 
+			x = TimeDistributed(Conv2DTranspose(filter_size,
 				kernel_size, strides=strides, padding='same'))(x)
 			x = BatchNormalization(gamma_regularizer=l2(weight_decay),
 												beta_regularizer=l2(weight_decay))(x)
 			x = Activation('relu')(x)
-			return x		
+			return x
+		def transpose_layer_3D(x,filter_size,dilation_rate=1,
+			kernel_size=3, strides=(1,2,2)):
+			x = Conv3DTranspose(filter_size,
+				kernel_size, strides=strides, padding='same')(x)
+			x = BatchNormalization(gamma_regularizer=l2(weight_decay),
+												beta_regularizer=l2(weight_decay))(x)
+			x = Activation('relu')(x)
+			return x
 		def im_pooling_layer(x,filter_size):
 			pooling=True
 			shape_before=tf.shape(x)
@@ -918,13 +997,13 @@ class NetModel(NetObject):
 				elif mode==2:
 					x=TimeDistributed(AveragePooling2D((32,32)))(x)
 					deb.prints(K.int_shape(x))
-					
+
 			deb.prints(K.int_shape(x))
 			#x=dilated_layer(x,filter_size,1,kernel_size=1)
 			deb.prints(K.int_shape(x))
 
 			if pooling==True:
-				x = TimeDistributed(Lambda(lambda y: K.tf.image.resize_bilinear(y,size=(32,32))))(x)
+				x = TimeDistributed(Lambda(lambda y: K.resize_images(y,32,32,'channels_last','bilinear')))(x)
 #				x = TimeDistributed(UpSampling2D(
 #					size=(self.patch_len,self.patch_len)))(x)
 			deb.prints(K.int_shape(x))
@@ -950,16 +1029,63 @@ class NetModel(NetObject):
 			out = keras.layers.concatenate(x, axis=4)
 			return out
 
+		def spatial_pyramid_pooling_3D(in_im,filter_size,
+			max_rate=8,global_average_pooling=False):
+			x=[]
+			if max_rate>=1:
+				x.append(dilated_layer_3D(in_im,filter_size,1))
+			if max_rate>=2:
+				x.append(dilated_layer_3D(in_im,filter_size,(1,2,2))) #6
+			if max_rate>=4:
+				x.append(dilated_layer_3D(in_im,filter_size,(2,4,4))) #12
+			if max_rate>=8:
+				x.append(dilated_layer_3D(in_im,filter_size,(4,8,8))) #18
+			if global_average_pooling==True:
+				x.append(im_pooling_layer(in_im,filter_size))
+			out = keras.layers.concatenate(x, axis=4)
+			return out
+
+		def temporal_pyramid_pooling(in_im,filter_size,
+			max_rate=4):
+			x=[]
+			if max_rate>=1:
+				x.append(dilated_layer_3D(in_im,filter_size,1))
+			if max_rate>=2:
+				x.append(dilated_layer_3D(in_im,filter_size,(2,1,1))) #2
+			if max_rate>=3:
+				x.append(dilated_layer_3D(in_im,filter_size,(3,1,1))) #2
+			if max_rate>=4:
+				x.append(dilated_layer_3D(in_im,filter_size,(4,1,1))) #4
+			if max_rate>=5:
+				x.append(dilated_layer_3D(in_im,filter_size,(5,1,1))) #4
+			out = keras.layers.concatenate(x, axis=4)
+			return out
+
+		def full_pyramid_pooling(in_im,filter_size,
+			max_rate=4):
+			x=[]
+			if max_rate>=1:
+				x.append(dilated_layer_3D(in_im,filter_size,1))
+			if max_rate>=2:
+				x.append(dilated_layer_3D(in_im,filter_size,(2,2,2))) #2
+			if max_rate>=3:
+				x.append(dilated_layer_3D(in_im,filter_size,(3,3,3))) #2
+			if max_rate>=4:
+				x.append(dilated_layer_3D(in_im,filter_size,(4,4,4))) #4
+			if max_rate>=5:
+				x.append(dilated_layer_3D(in_im,filter_size,(5,5,5))) #4
+			out = keras.layers.concatenate(x, axis=4)
+			return out
 
 		if self.model_type=='DenseNet':
 
 
 			#x = keras.layers.Permute((1,2,0,3))(in_im)
 			x = keras.layers.Permute((2,3,1,4))(in_im)
-			
+
 			x = Reshape((self.patch_len, self.patch_len,self.t_len*self.channel_n), name='predictions')(x)
 			out = DenseNetFCN((self.patch_len, self.patch_len, self.t_len*self.channel_n), nb_dense_block=2, growth_rate=16, dropout_rate=0.2,
-							nb_layers_per_block=2, upsampling_type='deconv', classes=self.class_n, 
+							nb_layers_per_block=2, upsampling_type='deconv', classes=self.class_n,
 							activation='softmax', batchsize=32,input_tensor=x)
 			self.graph = Model(in_im, out)
 			print(self.graph.summary())
@@ -968,10 +1094,10 @@ class NetModel(NetObject):
 
 			#x = keras.layers.Permute((2,3,1,4))(in_im)
 			x = ConvLSTM2D(32,3,return_sequences=False,padding="same")(in_im)
-			
+
 			#x = Reshape((self.patch_len, self.patch_len,self.t_len*self.channel_n), name='predictions')(x)
 			out = DenseNetFCN((self.patch_len, self.patch_len, self.channel_n), nb_dense_block=2, growth_rate=16, dropout_rate=0.2,
-							nb_layers_per_block=2, upsampling_type='deconv', classes=self.class_n, 
+							nb_layers_per_block=2, upsampling_type='deconv', classes=self.class_n,
 							activation='softmax', batchsize=32,input_tensor=x)
 			self.graph = Model(in_im, out)
 			print(self.graph.summary())
@@ -1007,7 +1133,7 @@ class NetModel(NetObject):
 			d2 = Conv2DTranspose(32, (3, 3), strides=(
 				2, 2), padding='same')(d3)
 			#d1 = keras.layers.concatenate([d2, e1[:,-1,:,:,:]], axis=3)
-			
+
 			d1 = Conv2DTranspose(16, (3, 3), strides=(
 				2, 2), padding='same')(d2)
 #			out = keras.layers.concatenate([d1, in_im[:,-1,:,:,:]], axis=3)
@@ -1024,10 +1150,10 @@ class NetModel(NetObject):
 			#x = keras.layers.Permute((2,3,1,4))(in_im)
 			x = Bidirectional(ConvLSTM2D(32,3,return_sequences=False,
 				padding="same"),merge_mode='concat')(in_im)
-			
+
 			#x = Reshape((self.patch_len, self.patch_len,self.t_len*self.channel_n), name='predictions')(x)
 			out = DenseNetFCN((self.patch_len, self.patch_len, self.channel_n), nb_dense_block=2, growth_rate=16, dropout_rate=0.2,
-							nb_layers_per_block=2, upsampling_type='deconv', classes=self.class_n, 
+							nb_layers_per_block=2, upsampling_type='deconv', classes=self.class_n,
 							activation='softmax', batchsize=32,input_tensor=x)
 			self.graph = Model(in_im, out)
 			print(self.graph.summary())
@@ -1050,7 +1176,7 @@ class NetModel(NetObject):
 						 padding='same'))(x)
 			x = BatchNormalization(gamma_regularizer=l2(weight_decay),
 							   beta_regularizer=l2(weight_decay))(x)
-			out = Activation('relu')(x)						 
+			out = Activation('relu')(x)
 			self.graph = Model(in_im, out)
 			print(self.graph.summary())
 		elif self.model_type=='ConvLSTM_seq2seq_bi_60x2':
@@ -1063,7 +1189,7 @@ class NetModel(NetObject):
 						 padding='same'))(x)
 			x = BatchNormalization(gamma_regularizer=l2(weight_decay),
 							   beta_regularizer=l2(weight_decay))(x)
-			x = Activation('relu')(x)						 
+			x = Activation('relu')(x)
 			self.graph = Model(in_im, out)
 			print(self.graph.summary())
 		elif self.model_type=='FCN_ConvLSTM_seq2seq_bi':
@@ -1085,7 +1211,7 @@ class NetModel(NetObject):
 			d2 = TimeDistributed(Conv2DTranspose(32, (3, 3), strides=(
 				2, 2), padding='same'))(d3)
 			#d1 = keras.layers.concatenate([d2, e1[:,-1,:,:,:]], axis=3)
-			
+
 			d1 = TimeDistributed(Conv2DTranspose(16, (3, 3), strides=(
 				2, 2), padding='same'))(d2)
 #			out = keras.layers.concatenate([d1, in_im[:,-1,:,:,:]], axis=3)
@@ -1100,10 +1226,10 @@ class NetModel(NetObject):
 
 			#x = keras.layers.Permute((1,2,0,3))(in_im)
 			#x = keras.layers.Permute((2,3,1,4))(in_im)
-			
+
 			#x = Reshape((self.patch_len, self.patch_len,self.t_len*self.channel_n), name='predictions')(x)
 			out = DenseNetFCNTimeDistributed((self.t_len, self.patch_len, self.patch_len, self.channel_n), nb_dense_block=2, growth_rate=16, dropout_rate=0.2,
-							nb_layers_per_block=2, upsampling_type='deconv', classes=self.class_n, 
+							nb_layers_per_block=2, upsampling_type='deconv', classes=self.class_n,
 							activation='softmax', batchsize=32,input_tensor=in_im,
 							recurrent_filters=60)
 			self.graph = Model(in_im, out)
@@ -1113,10 +1239,10 @@ class NetModel(NetObject):
 
 			#x = keras.layers.Permute((1,2,0,3))(in_im)
 			#x = keras.layers.Permute((2,3,1,4))(in_im)
-			
+
 			#x = Reshape((self.patch_len, self.patch_len,self.t_len*self.channel_n), name='predictions')(x)
 			out = DenseNetFCNTimeDistributed((self.t_len, self.patch_len, self.patch_len, self.channel_n), nb_dense_block=self.mp['dense']['nb_dense_block'], growth_rate=self.mp['dense']['growth_rate'], dropout_rate=0.2,
-							nb_layers_per_block=self.mp['dense']['nb_layers_per_block'], upsampling_type='deconv', classes=self.class_n, 
+							nb_layers_per_block=self.mp['dense']['nb_layers_per_block'], upsampling_type='deconv', classes=self.class_n,
 							activation='softmax', batchsize=32,input_tensor=in_im,
 							recurrent_filters=128)
 			self.graph = Model(in_im, out)
@@ -1126,11 +1252,11 @@ class NetModel(NetObject):
 
 			#x = keras.layers.Permute((1,2,0,3))(in_im)
 			#x = keras.layers.Permute((2,3,1,4))(in_im)
-			
+
 			#x = Reshape((self.patch_len, self.patch_len,self.t_len*self.channel_n), name='predictions')(x)
 			x=dilated_layer(in_im,16)
 			out = DenseNetFCNTimeDistributed((self.t_len, self.patch_len, self.patch_len, self.channel_n), nb_dense_block=2, growth_rate=64, dropout_rate=0.2,
-							nb_layers_per_block=2, upsampling_type='deconv', classes=self.class_n, 
+							nb_layers_per_block=2, upsampling_type='deconv', classes=self.class_n,
 							activation='softmax', batchsize=32,input_tensor=x,
 							recurrent_filters=128)
 			self.graph = Model(in_im, out)
@@ -1140,10 +1266,10 @@ class NetModel(NetObject):
 
 			#x = keras.layers.Permute((1,2,0,3))(in_im)
 			#x = keras.layers.Permute((2,3,1,4))(in_im)
-			
+
 			#x = Reshape((self.patch_len, self.patch_len,self.t_len*self.channel_n), name='predictions')(x)
 			out = DenseNetFCNTimeDistributed((self.t_len, self.patch_len, self.patch_len, self.channel_n), nb_dense_block=3, growth_rate=32, dropout_rate=0.2,
-							nb_layers_per_block=2, upsampling_type='deconv', classes=self.class_n, 
+							nb_layers_per_block=2, upsampling_type='deconv', classes=self.class_n,
 							activation='softmax', batchsize=32,input_tensor=in_im,
 							recurrent_filters=128)
 			self.graph = Model(in_im, out)
@@ -1300,14 +1426,14 @@ class NetModel(NetObject):
 
 			x = Bidirectional(ConvLSTM2D(128,3,return_sequences=True,
 				padding="same"))(pdc)
-	
+
 			# Decoder V3+
 			x = TimeDistributed(UpSampling2D(size=(2, 2)))(x)
 			x2 = dilated_layer(pdc2,128,1,kernel_size=1)#Low level features
 			x= keras.layers.concatenate([x, x2], axis=4)
 			x= dilated_layer(x,64,1,kernel_size=3)
 			x = TimeDistributed(UpSampling2D(size=(2, 2)))(x)
-			
+
 			out = TimeDistributed(Conv2D(self.class_n, (1, 1), activation=None,
 						 padding='same'))(x)
 		elif self.model_type=='deeplabv3plus':
@@ -1338,14 +1464,14 @@ class NetModel(NetObject):
 			x = TimeDistributed(Conv2D(self.class_n, (1, 1), activation=None,
 						 padding='same'))(x)
 			out = TimeDistributed(UpSampling2D(size=(2, 2)))(x)
-			
+
 
 			self.graph = Model(in_im, out)
 		elif self.model_type=='FCN_ConvLSTM_seq2seq_bi_skip':
 
 			#fs=32
 			fs=16
-			
+
 			p1=dilated_layer(in_im,fs)
 			e1 = TimeDistributed(AveragePooling2D((2, 2), strides=(2, 2)))(p1)
 			p2=dilated_layer(e1,fs*2)
@@ -1365,14 +1491,14 @@ class NetModel(NetObject):
 			out=dilated_layer(d1,fs)
 			out = TimeDistributed(Conv2D(self.class_n, (1, 1), activation=None,
 										padding='same'))(out)
-			
+
 		if self.model_type=='BUnetConvLSTM':
 
 
 			#fs=32
 			fs=16
 
-			p1=dilated_layer(in_im,fs)			
+			p1=dilated_layer(in_im,fs)
 			p1=dilated_layer(p1,fs)
 			e1 = TimeDistributed(AveragePooling2D((2, 2), strides=(2, 2)))(p1)
 			p2=dilated_layer(e1,fs*2)
@@ -1400,7 +1526,7 @@ class NetModel(NetObject):
 			#fs=32
 			fs=16
 
-			p1=dilated_layer(in_im,fs)			
+			p1=dilated_layer(in_im,fs)
 			p1=dilated_layer(p1,fs)
 			e1 = TimeDistributed(AveragePooling2D((2, 2), strides=(2, 2)))(p1)
 			p2=dilated_layer(e1,fs*2)
@@ -1428,7 +1554,7 @@ class NetModel(NetObject):
 			#fs=32
 			fs=16
 
-			p1=dilated_layer(in_im,fs)			
+			p1=dilated_layer(in_im,fs)
 			p1=dilated_layer(p1,fs)
 			e1 = TimeDistributed(AveragePooling2D((2, 2), strides=(2, 2)))(p1)
 			p2=dilated_layer(e1,fs*2)
@@ -1452,12 +1578,75 @@ class NetModel(NetObject):
 			print(self.graph.summary())
 		if self.model_type=='BUnet4ConvLSTM':
 
+			#fs=32
+			fs=64
+
+			p1=dilated_layer(in_im,fs)
+			p1=dilated_layer(p1,fs)
+			e1 = TimeDistributed(AveragePooling2D((2, 2), strides=(2, 2)))(p1)
+			p2=dilated_layer(e1,fs*2)
+			e2 = TimeDistributed(AveragePooling2D((2, 2), strides=(2, 2)))(p2)
+			p3=dilated_layer(e2,fs*4)
+			e3 = TimeDistributed(AveragePooling2D((2, 2), strides=(2, 2)))(p3)
+
+			x = Bidirectional(ConvLSTM2D(256,3,return_sequences=True,
+					padding="same"),merge_mode='concat')(e3)
+
+			d3 = transpose_layer(x,fs*4)
+			d3 = keras.layers.concatenate([d3, p3], axis=4)
+			d3=dilated_layer(d3,fs*4)
+			d2 = transpose_layer(d3,fs*2)
+			d2 = keras.layers.concatenate([d2, p2], axis=4)
+			d2=dilated_layer(d2,fs*2)
+			d1 = transpose_layer(d2,fs)
+			d1 = keras.layers.concatenate([d1, p1], axis=4)
+			out = dilated_layer(d1,fs)
+			out = TimeDistributed(Conv2D(self.class_n, (1, 1), activation=None,
+										padding='same'))(out)
+			self.graph = Model(in_im, out)
+			print(self.graph.summary())
+
+		if self.model_type=='BUnet4ConvLSTM_SkipLSTM':
+			fs=64
+			#fs=16
+
+			p1=dilated_layer(in_im,fs)
+			p1=dilated_layer(p1,fs)
+			x_p1 = Bidirectional(ConvLSTM2D(64,3,return_sequences=True,
+					padding="same"),merge_mode='concat')(p1)
+			e1 = TimeDistributed(AveragePooling2D((2, 2), strides=(2, 2)))(p1)
+			p2=dilated_layer(e1,fs*2)
+			x_p2 = Bidirectional(ConvLSTM2D(128,3,return_sequences=True,
+					padding="same"),merge_mode='concat')(p2)
+			e2 = TimeDistributed(AveragePooling2D((2, 2), strides=(2, 2)))(p2)
+			p3=dilated_layer(e2,fs*4)
+			x_p3 = Bidirectional(ConvLSTM2D(256,3,return_sequences=True,
+					padding="same"),merge_mode='concat')(p3)
+			e3 = TimeDistributed(AveragePooling2D((2, 2), strides=(2, 2)))(p3)
+
+			x = Bidirectional(ConvLSTM2D(512,3,return_sequences=True,
+					padding="same"),merge_mode='concat')(e3)
+
+			d3 = transpose_layer(x,fs*4)
+			d3 = keras.layers.concatenate([d3, x_p3], axis=4)
+			d3 = dilated_layer(d3,fs*4)
+			d2 = transpose_layer(d3,fs*2)
+			d2 = keras.layers.concatenate([d2, x_p2], axis=4)
+			d2 = dilated_layer(d2,fs*2)
+			d1 = transpose_layer(d2,fs)
+			d1 = keras.layers.concatenate([d1, x_p1], axis=4)
+			out = dilated_layer(d1,fs)
+			out = TimeDistributed(Conv2D(self.class_n, (1, 1), activation=None,
+										padding='same'))(out)
+			self.graph = Model(in_im, out)
+			print(self.graph.summary())
+		if self.model_type=='BUnet6ConvLSTM':
+
 
 			#fs=32
 			fs=16
 
-			p1=dilated_layer(in_im,fs)			
-			p1=dilated_layer(p1,fs)
+			p1=dilated_layer(in_im,fs)
 			e1 = TimeDistributed(AveragePooling2D((2, 2), strides=(2, 2)))(p1)
 			p2=dilated_layer(e1,fs*2)
 			e2 = TimeDistributed(AveragePooling2D((2, 2), strides=(2, 2)))(p2)
@@ -1486,7 +1675,7 @@ class NetModel(NetObject):
 			#fs=32
 			fs=16
 
-			p1=dilated_layer(in_im,fs)			
+			p1=dilated_layer(in_im,fs)
 			#p1=dilated_layer(p1,fs)
 			e1 = TimeDistributed(AveragePooling2D((2, 2), strides=(2, 2)))(p1)
 			p2=dilated_layer(e1,fs*2)
@@ -1516,7 +1705,7 @@ class NetModel(NetObject):
 			#fs=32
 			fs=16
 
-			p1=dilated_layer(in_im,fs)			
+			p1=dilated_layer(in_im,fs)
 			p1=dilated_layer(p1,fs)
 			e1 = TimeDistributed(AveragePooling2D((2, 2), strides=(2, 2)))(p1)
 			p2=dilated_layer(e1,fs*2)
@@ -1540,7 +1729,7 @@ class NetModel(NetObject):
 			#fs=32
 			fs=16
 
-			p1=dilated_layer(in_im,fs)			
+			p1=dilated_layer(in_im,fs)
 			p1=dilated_layer(p1,fs)
 			e1 = TimeDistributed(AveragePooling2D((2, 2), strides=(2, 2)))(p1)
 			p2=dilated_layer(e1,fs*2)
@@ -1567,13 +1756,13 @@ class NetModel(NetObject):
 
 			#fs=32
 			fs=16
-			
+
 			#x=dilated_layer(in_im,fs)
 			x=dilated_layer(in_im,fs)
 			x=dilated_layer(x,fs)
 			x=spatial_pyramid_pooling(x,fs*4,max_rate=8,
 				global_average_pooling=False)
-			
+
 			x = Bidirectional(ConvLSTM2D(128,3,return_sequences=True,
 					padding="same"),merge_mode='concat')(x)
 
@@ -1586,19 +1775,38 @@ class NetModel(NetObject):
 
 			#fs=32
 			fs=16
-			
+
 			#x=dilated_layer(in_im,fs)
 			x=dilated_layer(in_im,fs)
 			x=dilated_layer(x,fs)
 			x=spatial_pyramid_pooling(x,fs*4,max_rate=8,
 				global_average_pooling=True)
-			
+
 			x = Bidirectional(ConvLSTM2D(128,3,return_sequences=True,
 					padding="same"),merge_mode='concat')(x)
 
 			out=dilated_layer(x,fs)
 			out = TimeDistributed(Conv2D(self.class_n, (1, 1), activation=None,
 										padding='same'))(out)
+			self.graph = Model(in_im, out)
+			print(self.graph.summary())
+		elif self.model_type=='BAtrousGAPConvLSTM3D':
+
+			fs=32
+			#fs=16
+
+			#x=dilated_layer(in_im,fs)
+			x=dilated_layer_3D(in_im,fs)
+			x=dilated_layer_3D(x,fs)
+			x=spatial_pyramid_pooling_3D(x,fs*4,max_rate=8,
+				global_average_pooling=True)
+
+			x = Bidirectional(ConvLSTM2D(128,3,return_sequences=True, padding="same"),merge_mode='concat')(x)
+
+			out = dilated_layer_3D(x,fs)
+			out = Conv3D(self.class_n, (1, 1, 1), activation=None,
+										padding='same')(out)
+
 			self.graph = Model(in_im, out)
 			print(self.graph.summary())
 		elif self.model_type=='BUnetAtrousConvLSTM':
@@ -1662,10 +1870,10 @@ class NetModel(NetObject):
 
 			#x = keras.layers.Permute((1,2,0,3))(in_im)
 			#x = keras.layers.Permute((2,3,1,4))(in_im)
-			
+
 			#x = Reshape((self.patch_len, self.patch_len,self.t_len*self.channel_n), name='predictions')(x)
 			out = DenseNetFCNTimeDistributedAttention((self.t_len, self.patch_len, self.patch_len, self.channel_n), nb_dense_block=self.mp['dense']['nb_dense_block'], growth_rate=self.mp['dense']['growth_rate'], dropout_rate=0.2,
-							nb_layers_per_block=self.mp['dense']['nb_layers_per_block'], upsampling_type='deconv', classes=self.class_n, 
+							nb_layers_per_block=self.mp['dense']['nb_layers_per_block'], upsampling_type='deconv', classes=self.class_n,
 							activation='softmax', batchsize=32,input_tensor=in_im,
 							recurrent_filters=128)
 			self.graph = Model(in_im, out)
@@ -1677,7 +1885,7 @@ class NetModel(NetObject):
 			#fs=32
 			fs=64
 
-			#e1=dilated_layer(in_im,fs)			
+			#e1=dilated_layer(in_im,fs)
 			e1=dilated_layer(in_im,fs) # 64
 			e2 = TimeDistributed(AveragePooling2D((2, 2), strides=(2, 2)))(e1)
 			e2=dilated_layer(e2,fs*2) # 128
@@ -1704,7 +1912,7 @@ class NetModel(NetObject):
 			d1 = keras.layers.concatenate([d1, e1], axis=4) # 128
 			d1=dilated_layer(d1,fs) # 64 # this would concatenate with the date
 			x = Bidirectional(ConvLSTM2D(128,3,return_sequences=True,
-					padding="same"),merge_mode='concat')(d1)			
+					padding="same"),merge_mode='concat')(d1)
 			out = TimeDistributed(Conv2D(self.class_n, (1, 1), activation=None,
 										padding='same'))(x)
 			self.graph = Model(in_im, out)
@@ -1715,7 +1923,7 @@ class NetModel(NetObject):
 			#fs=32
 			fs=16
 
-			p1=dilated_layer(in_im,fs)			
+			p1=dilated_layer(in_im,fs)
 			p1=dilated_layer(p1,fs)
 			e1 = TimeDistributed(AveragePooling2D((2, 2), strides=(2, 2)))(p1)
 			p2=dilated_layer(e1,fs*2)
@@ -1740,17 +1948,148 @@ class NetModel(NetObject):
 										padding='same'))(out)
 			self.graph = Model(in_im, out)
 			print(self.graph.summary())
+		if self.model_type=='Unet3D':
+			fs=64
+			#fs=16
+
+			p1=dilated_layer_3D(in_im,fs,kernel_size=(7,3,3))
+			e1 = AveragePooling3D((1, 2, 2), strides=(1, 2, 2))(p1)
+			p2=dilated_layer_3D(e1,fs*2,kernel_size=(7,3,3))
+			e2 = AveragePooling3D((1, 2, 2), strides=(1, 2, 2))(p2)
+			p3=dilated_layer_3D(e2,fs*4,kernel_size=(7,3,3))
+			e3 = AveragePooling3D((1, 2, 2), strides=(1, 2, 2))(p3)
+
+			d3 = transpose_layer_3D(e3,fs*4)
+			d3 = keras.layers.concatenate([d3, p3], axis=4)
+			d3 = dilated_layer_3D(d3,fs*4,kernel_size=(7,3,3))
+			d2 = transpose_layer_3D(d3,fs*2)
+			d2 = keras.layers.concatenate([d2, p2], axis=4)
+			d2 = dilated_layer_3D(d2,fs*2,kernel_size=(7,3,3))
+			d1 = transpose_layer_3D(d2,fs)
+			d1 = keras.layers.concatenate([d1, p1], axis=4)
+			out = dilated_layer_3D(d1,fs,kernel_size=(7,3,3))
+			out = Conv3D(self.class_n, (1, 1, 1), activation=None,
+										padding='same')(out)
+			self.graph = Model(in_im, out)
+			print(self.graph.summary())
+
+		if self.model_type=='Unet3D_prog':
+			fs=64
+			#fs=16
+
+			p1=dilated_layer_3D(in_im,fs,kernel_size=(5,3,3))
+			e1 = AveragePooling3D((1, 2, 2), strides=(1, 2, 2))(p1)
+			p2=dilated_layer_3D(e1,fs*2,kernel_size=(7,5,5))
+			e2 = AveragePooling3D((1, 2, 2), strides=(1, 2, 2))(p2)
+			p3=dilated_layer_3D(e2,fs*4,kernel_size=(5,3,3))
+			e3 = AveragePooling3D((1, 2, 2), strides=(1, 2, 2))(p3)
+
+			d3 = transpose_layer_3D(e3,fs*4)
+			d3 = keras.layers.concatenate([d3, p3], axis=4)
+			d3 = dilated_layer_3D(d3,fs*4,kernel_size=(5,3,3))
+			d2 = transpose_layer_3D(d3,fs*2)
+			d2 = keras.layers.concatenate([d2, p2], axis=4)
+			d2 = dilated_layer_3D(d2,fs*2,kernel_size=(7,5,5))
+			d1 = transpose_layer_3D(d2,fs)
+			d1 = keras.layers.concatenate([d1, p1], axis=4)
+			out = dilated_layer_3D(d1,fs,kernel_size=(5,3,3))
+			out = Conv3D(self.class_n, (1, 1, 1), activation=None,
+										padding='same')(out)
+			self.graph = Model(in_im, out)
+			print(self.graph.summary())
+
+		if self.model_type=='Unet3D_LSTM':
+			fs=32
+			#fs=16
+
+			p1=dilated_layer_3D(in_im,fs,kernel_size=(3,7,7))
+			e1 = AveragePooling3D((1, 2, 2), strides=(1, 2, 2))(p1)
+			p2=dilated_layer_3D(e1,fs*2,kernel_size=(7,3,3))
+			e2 = AveragePooling3D((1, 2, 2), strides=(1, 2, 2))(p2)
+			p3=dilated_layer_3D(e2,fs*4,kernel_size=(7,3,3))
+			e3 = AveragePooling3D((1, 2, 2), strides=(1, 2, 2))(p3)
+
+			x = Bidirectional(ConvLSTM2D(256,3,return_sequences=True,
+					padding="same"),merge_mode='concat')(e3)
+
+			d3 = transpose_layer_3D(x,fs*4)
+			d3 = keras.layers.concatenate([d3, p3], axis=4)
+			d3 = dilated_layer_3D(d3,fs*4,kernel_size=(7,3,3))
+			d2 = transpose_layer_3D(d3,fs*2)
+			d2 = keras.layers.concatenate([d2, p2], axis=4)
+			d2 = dilated_layer_3D(d2,fs*2,kernel_size=(7,3,3))
+			d1 = transpose_layer_3D(d2,fs)
+			d1 = keras.layers.concatenate([d1, p1], axis=4)
+			out = dilated_layer_3D(d1,fs,kernel_size=(7,3,3))
+			out = Conv3D(self.class_n, (1, 1, 1), activation=None,
+										padding='same')(out)
+			self.graph = Model(in_im, out)
+			print(self.graph.summary())
+
+		if self.model_type=='Unet3D_ATPP':
+			#fs=8
+			max_rate=3
+			fs=32
+
+			p1=temporal_pyramid_pooling(in_im,fs,max_rate)
+			e1 = AveragePooling3D((1, 2, 2), strides=(1, 2, 2))(p1)
+			p2=temporal_pyramid_pooling(e1,fs*2,max_rate)
+			e2 = AveragePooling3D((1, 2, 2), strides=(1, 2, 2))(p2)
+			p3=temporal_pyramid_pooling(e2,fs*4,max_rate)
+			e3 = AveragePooling3D((1, 2, 2), strides=(1, 2, 2))(p3)
+
+			d3 = transpose_layer_3D(e3,fs*4)
+			d3 = keras.layers.concatenate([d3, p3], axis=4)
+			d3 = temporal_pyramid_pooling(d3,fs*4,max_rate)
+			d2 = transpose_layer_3D(d3,fs*2)
+			d2 = keras.layers.concatenate([d2, p2], axis=4)
+			d3 = temporal_pyramid_pooling(d2,fs*2,max_rate)
+			d1 = transpose_layer_3D(d2,fs)
+			d1 = keras.layers.concatenate([d1, p1], axis=4)
+			out = temporal_pyramid_pooling(d1,fs,max_rate)
+			out = Conv3D(self.class_n, (1, 1, 1), activation=None,
+										padding='same')(out)
+			self.graph = Model(in_im, out)
+			print(self.graph.summary())
+
+		if self.model_type=='Unet3D_AFPP':
+			fs=32
+			max_rate=4
+			#fs=16
+
+			p1=full_pyramid_pooling(in_im,fs,max_rate)
+			e1 = AveragePooling3D((1, 2, 2), strides=(1, 2, 2))(p1)
+			p2=full_pyramid_pooling(e1,fs*2,max_rate)
+			e2 = AveragePooling3D((1, 2, 2), strides=(1, 2, 2))(p2)
+			p3=full_pyramid_pooling(e2,fs*4,max_rate)
+			e3 = AveragePooling3D((1, 2, 2), strides=(1, 2, 2))(p3)
+
+			d3 = transpose_layer_3D(e3,fs*4)
+			d3 = keras.layers.concatenate([d3, p3], axis=4)
+			d3 = full_pyramid_pooling(d3,fs*4,max_rate)
+			d2 = transpose_layer_3D(d3,fs*2)
+			d2 = keras.layers.concatenate([d2, p2], axis=4)
+			d3 = full_pyramid_pooling(d2,fs*2,max_rate)
+			d1 = transpose_layer_3D(d2,fs)
+			d1 = keras.layers.concatenate([d1, p1], axis=4)
+			out = full_pyramid_pooling(d1,fs,max_rate)
+			out = Conv3D(self.class_n, (1, 1, 1), activation=None,
+										padding='same')(out)
+			self.graph = Model(in_im, out)
+			print(self.graph.summary())
+
+
 # ==================================== ATTENTION ATTEMPTS =================================== #
 		elif self.model_type=='ConvLSTM_seq2seq_bi_attention':
 #			out = TimeDistributed(Conv2D(self.class_n, (1, 1), activation='softmax',
 #						 padding='same'))(x)
 
-			
+
 			# attention
 
 			# shape is (t,h,w,c). We want shape (c,h,w,t)
 			# then timedistributed conv. 1x1 applies attention to t
-			# then return 
+			# then return
 			x = keras.layers.Permute((4,2,3,1))(in_im)
 			x = TimeDistributed(Conv2D(self.t_len, (1, 1), activation=None,
 						 padding='same'))(x)
@@ -1760,7 +2099,7 @@ class NetModel(NetObject):
 			x = Bidirectional(ConvLSTM2D(128,3,return_sequences=True,
 				padding="same"))(x)
 
-			
+
 			x = TimeDistributed(Conv2D(self.class_n, (1, 1), activation=None,
 						 padding='same'))(x)
 			x = BatchNormalization(gamma_regularizer=l2(weight_decay),
@@ -1776,12 +2115,12 @@ class NetModel(NetObject):
 #			out = TimeDistributed(Conv2D(self.class_n, (1, 1), activation='softmax',
 #						 padding='same'))(x)
 
-			
+
 			# attention
 
 			# shape is (t,h,w,c). We want shape (c,h,w,t)
 			# then timedistributed conv. 1x1 applies attention to t
-			# then return 
+			# then return
 			def attention_weights(x):
 				att = keras.layers.Permute((4,2,3,1))(x)
 				att = TimeDistributed(Conv2D(self.t_len, (1, 1), activation=None,
@@ -1794,7 +2133,7 @@ class NetModel(NetObject):
 			x = Bidirectional(ConvLSTM2D(128,3,return_sequences=True,
 				padding="same"))(x)
 
-			
+
 			x = TimeDistributed(Conv2D(self.class_n, (1, 1), activation=None,
 						 padding='same'))(x)
 			x = BatchNormalization(gamma_regularizer=l2(weight_decay),
@@ -1823,7 +2162,7 @@ class NetModel(NetObject):
 						 padding='same'))(x)
 			x = BatchNormalization(gamma_regularizer=l2(weight_decay),
 							   beta_regularizer=l2(weight_decay))(x)
-			out = Activation('relu')(x)						 
+			out = Activation('relu')(x)
 			self.graph = Model(in_im, out)
 			print(self.graph.summary())
 		if self.model_type=='BUnet4ConvLSTM_SelfAttention':
@@ -1832,7 +2171,7 @@ class NetModel(NetObject):
 			#fs=32
 			fs=16
 
-			p1=dilated_layer(in_im,fs)			
+			p1=dilated_layer(in_im,fs)
 			p1=dilated_layer(p1,fs)
 			e1 = TimeDistributed(AveragePooling2D((2, 2), strides=(2, 2)))(p1)
 			p2=dilated_layer(e1,fs*2)
@@ -1871,7 +2210,7 @@ class NetModel(NetObject):
 			#fs=32
 			fs=16
 
-			p1=dilated_layer(in_im,fs)			
+			p1=dilated_layer(in_im,fs)
 			p1=dilated_layer(p1,fs)
 			e1 = TimeDistributed(AveragePooling2D((2, 2), strides=(2, 2)))(p1)
 			p2=dilated_layer(e1,fs*2)
@@ -1923,18 +2262,18 @@ class NetModel(NetObject):
 				x = BatchNormalization(gamma_regularizer=l2(weight_decay),
 								beta_regularizer=l2(weight_decay))(x)
 				x = Activation('relu')(x)
-				return x		
-			def transpose_layer(x,filter_size,dilation_rate=1, 
+				return x
+			def transpose_layer(x,filter_size,dilation_rate=1,
 				kernel_size=3, strides=(2,2)):
-				x = Conv2DTranspose(filter_size, 
+				x = Conv2DTranspose(filter_size,
 					kernel_size, strides=strides, padding='same')(x)
 				x = BatchNormalization(gamma_regularizer=l2(weight_decay),
 													beta_regularizer=l2(weight_decay))(x)
 				x = Activation('relu')(x)
-				return x		
+				return x
 			fs=16
 
-			p1=conv_layer(x,fs)			
+			p1=conv_layer(x,fs)
 			p1=conv_layer(p1,fs)
 			e1 = AveragePooling2D((2, 2), strides=(2, 2))(p1)
 			p2=conv_layer(e1,fs*2)
@@ -1976,13 +2315,6 @@ class NetModel(NetObject):
 		with open('model_summary.txt','w') as fh:
 			self.graph.summary(line_length=125,print_fn=lambda x: fh.write(x+'\n'))
 		#self.graph.summary(print_fn=model_summary_print)
-	def compile(self, optimizer, loss='binary_crossentropy', metrics=['accuracy',metrics.categorical_accuracy],loss_weights=None):
-		#loss_weighted=weighted_categorical_crossentropy(loss_weights)
-		loss_weighted=weighted_categorical_crossentropy_ignoring_last_label(loss_weights)
-		#sparse_accuracy_ignoring_last_label()
-		self.graph.compile(loss=loss_weighted, optimizer=optimizer, metrics=metrics)
-		#self.graph.compile(loss=sparse_accuracy_ignoring_last_label, optimizer=optimizer, metrics=metrics)
-		#self.graph.compile(loss='categorical_crossentropy', optimizer=optimizer, metrics=metrics)
 	def loss_weights_estimate(self,data):
 		unique,count=np.unique(data.patches['train']['label'].argmax(axis=4),return_counts=True)
 		unique=unique[1:] # No bcknd
@@ -1994,7 +2326,7 @@ class NetModel(NetObject):
 		deb.prints(unique)
 		self.loss_weights=np.zeros(self.class_n)
 		for clss in range(1,self.class_n): # class 0 is bcknd. Leave it in 0
-			
+
 			if clss in unique:
 				self.loss_weights[clss]=weights_from_unique[unique==clss]
 			else:
@@ -2004,7 +2336,7 @@ class NetModel(NetObject):
 		self.loss_weights[1:]=1
 		self.loss_weights=self.loss_weights[1:]
 		deb.prints(self.loss_weights.shape)
-		
+
 	def test(self,data):
 		data.patches['train']['batch_n'] = data.patches['train']['in'].shape[0]//self.batch['train']['size']
 		data.patches['test']['batch_n'] = data.patches['test']['in'].shape[0]//self.batch['test']['size']
@@ -2036,13 +2368,13 @@ class NetModel(NetObject):
 			data.patches['test']['prediction'][idx0:idx1]=self.graph.predict(batch['test']['in'],batch_size=self.batch['test']['size'])
 
 		#====================METRICS GET================================================#
-		deb.prints(data.patches['test']['label'].shape)		
+		deb.prints(data.patches['test']['label'].shape)
 		deb.prints(idx1)
-		print("Epoch={}".format(epoch))	
-		
+		print("Epoch={}".format(epoch))
+
 		# Average epoch loss
 		self.metrics['test']['loss'] /= self.batch['test']['n']
-			
+
 		# Get test metrics
 		metrics=data.metrics_get(data.patches['test'],debug=1)
 		print('oa={}, aa={}, f1={}, f1_wght={}'.format(metrics['overall_acc'],
@@ -2065,9 +2397,9 @@ class NetModel(NetObject):
 
 		self.train_loop(data)
 
-	def early_stop_check(self,metrics,epoch,most_important='overall_acc'):
+	def early_stop_check(self,metrics,epoch,most_important='overall_acc',min_delta=0.00):
 
-		if metrics[most_important]>=self.early_stop['best'] and self.early_stop["signal"]==False:
+		if metrics[most_important]>=self.early_stop['best']+min_delta and self.early_stop["signal"]==False:
 			self.early_stop['best']=metrics[most_important]
 			self.early_stop['count']=0
 			print("Best metric updated")
@@ -2082,8 +2414,8 @@ class NetModel(NetObject):
 
 			#else:
 				#self.early_stop["signal"]=False
-			
-			
+
+
 	def train_loop(self, data):
 		print('Start the training')
 		cback_tboard = keras.callbacks.TensorBoard(
@@ -2091,8 +2423,8 @@ class NetModel(NetObject):
 		txt={'count':0,'val':{},'test':{}}
 		txt['val']={'metrics':[],'epoch':[],'loss':[]}
 		txt['test']={'metrics':[],'epoch':[],'loss':[]}
-		
-		
+
+
 		#========= VAL INIT
 
 
@@ -2102,10 +2434,10 @@ class NetModel(NetObject):
 
 		count,unique=np.unique(data.patches['train']['label'].argmax(axis=4),return_counts=True)
 		print("Train count,unique",count,unique)
-		
+
 		count,unique=np.unique(data.patches['test']['label'].argmax(axis=4),return_counts=True)
 		print("Test count,unique",count,unique)
-		
+
 		#==================== ESTIMATE BATCH NUMBER===============================#
 		batch = {'train': {}, 'test': {}, 'val':{}}
 		self.batch['train']['n'] = data.patches['train']['in'].shape[0] // self.batch['train']['size']
@@ -2115,7 +2447,7 @@ class NetModel(NetObject):
 		data.patches['test']['prediction']=np.zeros_like(data.patches['test']['label'][:,:,:,:,:-1])
 		deb.prints(data.patches['test']['label'].shape)
 		deb.prints(self.batch['test']['n'])
-		
+
 		self.early_stop["signal"]=False
 		#if self.train_mode==
 
@@ -2128,7 +2460,7 @@ class NetModel(NetObject):
 			idxs=np.random.permutation(data.patches['train']['in'].shape[0])
 			data.patches['train']['in']=data.patches['train']['in'][idxs]
 			data.patches['train']['label']=data.patches['train']['label'][idxs]
-			
+
 			self.metrics['train']['loss'] = np.zeros((1, 2))
 			self.metrics['test']['loss'] = np.zeros((1, 2))
 			self.metrics['val']['loss'] = np.zeros((1, 2))
@@ -2138,7 +2470,7 @@ class NetModel(NetObject):
 
 			#=============================TRAIN LOOP=========================================#
 			for batch_id in range(0, self.batch['train']['n']):
-				
+
 				idx0 = batch_id*self.batch['train']['size']
 				idx1 = (batch_id+1)*self.batch['train']['size']
 
@@ -2147,7 +2479,7 @@ class NetModel(NetObject):
 				if self.time_measure==True:
 					start_time=time.time()
 				self.metrics['train']['loss'] += self.graph.train_on_batch(
-					batch['train']['in'].astype(np.float32), 
+					batch['train']['in'].astype(np.float32),
 					np.expand_dims(batch['train']['label'].argmax(axis=4),axis=4).astype(np.int8))		# Accumulated epoch
 				if self.time_measure==True:
 					batch_time=time.time()-start_time
@@ -2175,7 +2507,7 @@ class NetModel(NetObject):
 
 					if self.batch_test_stats:
 						self.metrics['val']['loss'] += self.graph.test_on_batch(
-							batch['val']['in'].astype(np.float32), 
+							batch['val']['in'].astype(np.float32),
 							np.expand_dims(batch['val']['label'].argmax(axis=4),axis=4).astype(np.int8))		# Accumulated epoch
 
 					data.patches['val']['prediction'][idx0:idx1]=self.graph.predict(
@@ -2195,7 +2527,7 @@ class NetModel(NetObject):
 				metrics_val['per_class_acc'].setflags(write=1)
 				metrics_val['per_class_acc'][np.isnan(metrics_val['per_class_acc'])]=-1
 				print(metrics_val['per_class_acc'])
-				
+
 				# if epoch % 5 == 0:
 				# 	print("Writing val...")
 				# 	#print(txt['val']['metrics'])
@@ -2210,12 +2542,18 @@ class NetModel(NetObject):
 				# 	txt['val']['loss'].append(self.metrics['val']['loss'])
 				# 	txt['val']['epoch'].append(epoch)
 
-			
+
 			#==========================TEST LOOP================================================#
 			if self.early_stop['signal']==True:
+				print(" ============= EARLY STOP ACHIEVED ===============")
+				print("============= LOADING EARLY STOP BEST WEIGHTS ===============")
 				self.graph.load_weights('weights_best.h5')
 			test_loop_each_epoch=False
-			if test_loop_each_epoch==True or self.early_stop['signal']==True:
+			print('Stop epoch is {}. Current epoch is {}/{}'.format(self.stop_epoch,epoch,self.stop_epoch))
+			deb.prints(self.stop_epoch==epoch)
+
+			if test_loop_each_epoch==True or self.early_stop['signal']==True or (self.stop_epoch>=0 and self.stop_epoch==epoch):
+				print("======== BEGINNING TEST PREDICT... ============")
 				data.patches['test']['prediction']=np.zeros_like(data.patches['test']['label'][:,:,:,:,:-1])
 				self.batch_test_stats=False
 
@@ -2228,44 +2566,37 @@ class NetModel(NetObject):
 
 					if self.batch_test_stats:
 						self.metrics['test']['loss'] += self.graph.test_on_batch(
-							batch['test']['in'].astype(np.float32), 
+							batch['test']['in'].astype(np.float32),
 							np.expand_dims(batch['test']['label'].argmax(axis=4),axis=4).astype(np.int8))		# Accumulated epoch
 
 					data.patches['test']['prediction'][idx0:idx1]=self.graph.predict(
-						batch['test']['in'].astype(np.float32),batch_size=self.batch['test']['size'])
-
+						batch['test']['in'].astype(np.float32),batch_size=self.batch['test']['size'])*13
 
 			#====================METRICS GET================================================#
-			deb.prints(data.patches['test']['label'].shape)		
+			deb.prints(data.patches['test']['label'].shape)
 			deb.prints(idx1)
-			print("Epoch={}".format(epoch))	
-			
+			print("Epoch={}".format(epoch))
+
 			if self.batch_test_stats==True:
 				# Average epoch loss
 				self.metrics['test']['loss'] /= self.batch['test']['n']
 			# Get test metrics
 			metrics=data.metrics_get(data.patches['test'],debug=1)
-			
+			if test_loop_each_epoch==True:
+				print("Test metrics are printed each epoch. Metrics:",epoch,metrics)
+
 			if self.early_stop['best_updated']==True:
 				if test_loop_each_epoch==True:
 					self.early_stop['best_predictions']=data.patches['test']['prediction']
 				self.graph.save_weights('weights_best.h5')
 				if self.model_save==True:
 					self.graph.save('model_best.h5')
-				
+
 			print(self.early_stop['signal'])
-			if self.early_stop["signal"]==True:
-				self.early_stop['best_predictions']=data.patches['test']['prediction']
-				print("EARLY STOP EPOCH",epoch,metrics)
-				training_time=round(time.time()-init_time,2)
-				print("Training time",training_time)
-				metadata = "Timestamp:"+ str(round(time.time(),2))+". Model: "+self.model_type+". Training time: "+str(training_time)+"\n"
-				print(metadata)
-				txt_append("metadata.txt",metadata)
-				np.save("prediction.npy",self.early_stop['best_predictions'])
-				np.save("labels.npy",data.patches['test']['label'])
+			if self.early_stop["signal"]==True or (self.stop_epoch>=0 and self.stop_epoch==epoch):
+				self.final_accuracy_report(data,epoch,metrics,init_time)
 				break
-				
+
 			# Check early stop and store results if they are the best
 			#if epoch % 5 == 0:
 			#	print("Writing to file...")
@@ -2296,7 +2627,7 @@ class NetModel(NetObject):
 			deb.prints(metrics['per_class_acc'])
 			if self.val_set:
 				deb.prints(metrics_val['per_class_acc'])
-			
+
 			print('oa={}, aa={}, f1={}, f1_wght={}'.format(metrics['overall_acc'],
 				metrics['average_acc'],metrics['f1_score'],metrics['f1_score_weighted']))
 			if self.val_set:
@@ -2304,7 +2635,7 @@ class NetModel(NetObject):
 					metrics_val['average_acc'],metrics_val['f1_score'],metrics_val['f1_score_weighted']))
 			if self.batch_test_stats==True:
 				if self.val_set:
-				
+
 					print("Loss. Train={}, Val={}, Test={}".format(self.metrics['train']['loss'],
 						self.metrics['val']['loss'],self.metrics['test']['loss']))
 				else:
@@ -2312,148 +2643,192 @@ class NetModel(NetObject):
 			else:
 				print("Train loss",self.metrics['train']['loss'])
 			#====================END METRICS GET===========================================#
-
+	def final_accuracy_report(self,data,epoch,metrics,init_time):
+		self.early_stop['best_predictions']=data.patches['test']['prediction']
+		print("EARLY STOP EPOCH",epoch,metrics)
+		training_time=round(time.time()-init_time,2)
+		print("Training time",training_time)
+		metadata = "Timestamp:"+ str(round(time.time(),2))+". Model: "+self.model_type+". Training time: "+str(training_time)+"\n"
+		print(metadata)
+		txt_append("metadata.txt",metadata)
+		np.save("prediction.npy",self.early_stop['best_predictions'])
+		np.save("labels.npy",data.patches['test']['label'])
 
 flag = {"data_create": 2, "label_one_hot": True}
 if __name__ == '__main__':
+
+	premade_split_patches_load=True
+
+
+	deb.prints(premade_split_patches_load)
 	#
-	
+	patchesArray = PatchesArray()
 	time_measure=False
-	#if data.dataset=='seq2':
-	#	args.class_n=10
 
 	data = Dataset(patch_len=args.patch_len, patch_step_train=args.patch_step_train,
 		patch_step_test=args.patch_step_test,exp_id=args.exp_id,
 		path=args.path, t_len=args.t_len, class_n=args.class_n)
 
-	#data.dataset='seq2'
 
-	if flag['data_create']==1:
-		data.create()
-	elif flag['data_create']==2:
-		data.create_load()
+	args.patience=10
 
-	if data.dataset=='seq1' or data.dataset=='seq2':
-		args.patience=10
-	else:
-		args.patience=15
-	
-	
 	val_set=True
 	#val_set_mode='stratified'
 	val_set_mode='stratified'
 	#val_set_mode='random'
+	if premade_split_patches_load==False:
+		randomly_subsample_sets=True
 
-	deb.prints(data.patches['train']['label'].shape)
+		data.create_load()
 
-	
-	deb.prints(data.patches['train']['label'].shape)
-	deb.prints(data.patches['test']['label'].shape)
-	
-	test_label_unique,test_label_count=np.unique(data.patches['test']['label'].argmax(axis=4),return_counts=True)
-	deb.prints(test_label_unique)
-	deb.prints(test_label_count)
-	train_label_unique,train_label_count=np.unique(data.patches['train']['label'].argmax(axis=4),return_counts=True)
-	deb.prints(train_label_unique)
-	deb.prints(train_label_count)
-	data.label_unique=test_label_unique.copy()
-	
+
+
+
+
+		deb.prints(data.patches['train']['label'].shape)
+		deb.prints(data.patches['test']['label'].shape)
+
+		test_label_unique,test_label_count=np.unique(data.patches['test']['label'].argmax(axis=4),return_counts=True)
+		deb.prints(test_label_unique)
+		deb.prints(test_label_count)
+		train_label_unique,train_label_count=np.unique(data.patches['train']['label'].argmax(axis=4),return_counts=True)
+		deb.prints(train_label_unique)
+		deb.prints(train_label_count)
+		data.label_unique=test_label_unique.copy()
+
 
 
 
 	#adam = Adam(lr=0.0001, beta_1=0.9)
-	#adam = Adam(lr=0.001, beta_1=0.9)
-	
-	adam = Adagrad(0.01)
+	adam = Adam(lr=0.001, beta_1=0.9)
+
+	#adam = Adagrad(0.01)
+	#model = ModelLoadEachBatch(epochs=args.epochs, patch_len=args.patch_len,
 	model = NetModel(epochs=args.epochs, patch_len=args.patch_len,
 					 patch_step_train=args.patch_step_train, eval_mode=args.eval_mode,
 					 batch_size_train=args.batch_size_train,batch_size_test=args.batch_size_test,
 					 patience=args.patience,t_len=args.t_len,class_n=args.class_n,path=args.path,
-					 val_set=val_set,model_type=args.model_type, time_measure=time_measure)
+					 val_set=val_set,model_type=args.model_type, time_measure=time_measure, stop_epoch=args.stop_epoch)
 	model.class_n=data.class_n-1 # Model is designed without background class
 	deb.prints(data.class_n)
 	model.build()
-	model.class_n+=1 # This is used in loss_weights_estimate, val_set_get, semantic_balance (To-do: Eliminate bcknd class)
-	deb.prints(data.patches['train']['label'].shape)
 
-	# === SELECT VALIDATION SET FROM TRAIN SET
-	val_set = True # fix this
-	if val_set:
-		data.val_set_get(val_set_mode,0.15)
-		deb.prints(data.patches['val']['label'].shape)
-	balancing=True
-	if balancing==True:
+	if premade_split_patches_load==False:
+		model.class_n+=1 # This is used in loss_weights_estimate, val_set_get, semantic_balance (To-do: Eliminate bcknd class)
 
-		
-		# If patch balancing
-		
-		if data.dataset=='seq1' or data.dataset=='seq2':
-			#data.semantic_balance(500) #Changed from 1000
+		print("=== SELECT VALIDATION SET FROM TRAIN SET")
+
+		val_set = True # fix this
+		if val_set:
+			data.val_set_get(val_set_mode,0.15)
+			deb.prints(data.patches['val']['label'].shape)
+
+		print("=== AUGMENTING TRAINING DATA")
+
+		balancing=True
+		if balancing==True:
 			data.semantic_balance(500) #More for seq2seq
-			
-		else:
-			data.semantic_balance(300)
-	model.loss_weights_estimate(data)
 
-	model.class_n-=1
-	# Label background from 0 to last. 
+
+
+		model.loss_weights_estimate(data)
+		np.save(data.path_patches_bckndfixed+'loss_weights.npy',model.loss_weights)
+		model.class_n-=1
+
+
+	if premade_split_patches_load==False:
+		# Label background from 0 to last.
+		deb.prints(data.patches['train']['label'].shape)
+		# ===
+		def label_bcknd_from_0_to_last(label_one_hot,class_n):
+			print("Changing bcknd from 0 to last...")
+			deb.prints(np.unique(label_one_hot.argmax(axis=4),return_counts=True))
+
+			label_h=np.reshape(label_one_hot,(-1,label_one_hot.shape[-1]))
+			print("label_h",label_h.shape)
+			label_int=label_h.argmax(axis=1)
+			label_int[label_int==0]=class_n+1# This number counts the bcknd. So if 3 classes+bcknd=4, class_n=4
+			label_int-=1
+
+			out = np.zeros((label_int.shape[0], class_n+1))
+			out[np.arange(label_int.shape[0]),label_int]=1
+			deb.prints(out.shape)
+			out=np.reshape(out,(label_one_hot.shape))
+
+			deb.prints(np.unique(out.argmax(axis=4),return_counts=True))
+
+			return out.astype(np.int8)
+
+		# def label_bcknd_from_0_to_last(label,class_n):
+		# 	print("Changing bcknd from 0 to last...")
+		# 	deb.prints(np.unique(label.argmax(axis=4),return_counts=True))
+
+		# 	out=np.zeros_like(label)
+		# 	valid_class_ids=[i for i in range(1,class_n+1)]
+		# 	out=label[:,:,:,:,valid_class_ids+[0]]
+		# 	deb.prints(np.unique(out.argmax(axis=4),return_counts=True))
+
+		# 	return out
+
+
+		deb.prints(data.patches['train']['label'][560,:,15,15,:])
+		data.patches['train']['label']=label_bcknd_from_0_to_last(
+			data.patches['train']['label'],model.class_n)
+		deb.prints(data.patches['train']['label'][560,:,15,15,:])
+
+		data.patches['test']['label']=label_bcknd_from_0_to_last(
+			data.patches['test']['label'],model.class_n)
+		data.patches['val']['label']=label_bcknd_from_0_to_last(
+			data.patches['val']['label'],model.class_n)
+		data.patches['test']['in']=data.patches['test']['in'].astype(np.float32)
+		data.patches['train']['in']=data.patches['train']['in'].astype(np.float32)
+		deb.prints(data.patches['val']['label'].shape)
+
+		#========== this is only for google colab. Ram usage should be lower
+		if randomly_subsample_sets==True:
+			print("# =========== subsampling patches...")
+			data.patches['train']=data.randomly_pick_samples_from_set(data.patches['train'], 2000)
+			data.patches['test']=data.randomly_pick_samples_from_set(data.patches['test'], 2000)
+			deb.prints(data.patches['train']['in'].shape)
+			deb.prints(data.patches['test']['in'].shape)
+
+		# store patches to npy (in a separate folder!)
+		data.patchesStore(data.patches['train'],'train_bckndfixed')
+		data.patchesStore(data.patches['test'],'test_bckndfixed')
+		data.patchesStore(data.patches['val'],'val_bckndfixed')
+
+	else:
+		print("===== LOADING PRE-COMPUTED AUGMENTED AND VAL PATCHES... ======")
+		data.patches['val']=data.patchesLoad('val_bckndfixed')
+		data.patches['train']=data.patchesLoad('train_bckndfixed')
+		data.patches['test']=data.patchesLoad('test_bckndfixed')
+		model.loss_weights=np.load(data.path_patches_bckndfixed+'loss_weights.npy')
 	deb.prints(data.patches['train']['label'].shape)
-	# ===
-	def label_bcknd_from_0_to_last(label_one_hot,class_n):		
-		print("Changing bcknd from 0 to last...")
-		deb.prints(np.unique(label_one_hot.argmax(axis=4),return_counts=True))
 
-		label_h=np.reshape(label_one_hot,(-1,label_one_hot.shape[-1]))
-		print("label_h",label_h.shape)
-		label_int=label_h.argmax(axis=1)
-		label_int[label_int==0]=class_n+1# This number counts the bcknd. So if 3 classes+bcknd=4, class_n=4
-		label_int-=1
+	#deb.prints_vars_memory()
+	print(data.patches['train']['in'].nbytes,data.patches['val']['in'].nbytes,data.patches['test']['in'].nbytes)
+	#pdb.set_trace()
 
-		out = np.zeros((label_int.shape[0], class_n+1))
-		out[np.arange(label_int.shape[0]),label_int]=1
-		deb.prints(out.shape)
-		out=np.reshape(out,(label_one_hot.shape))
-
-		deb.prints(np.unique(out.argmax(axis=4),return_counts=True))
-
-		return out.astype(np.int8)	
-
-	# def label_bcknd_from_0_to_last(label,class_n):	
-	# 	print("Changing bcknd from 0 to last...")
-	# 	deb.prints(np.unique(label.argmax(axis=4),return_counts=True))
-
-	# 	out=np.zeros_like(label)
-	# 	valid_class_ids=[i for i in range(1,class_n+1)]
-	# 	out=label[:,:,:,:,valid_class_ids+[0]]
-	# 	deb.prints(np.unique(out.argmax(axis=4),return_counts=True))
-
-	# 	return out
-
-
-	deb.prints(data.patches['train']['label'][560,:,15,15,:])
-	data.patches['train']['label']=label_bcknd_from_0_to_last(
-		data.patches['train']['label'],model.class_n)
-	deb.prints(data.patches['train']['label'][560,:,15,15,:])
-
-	data.patches['test']['label']=label_bcknd_from_0_to_last(
-		data.patches['test']['label'],model.class_n)
-	data.patches['val']['label']=label_bcknd_from_0_to_last(
-		data.patches['val']['label'],model.class_n)
-	data.patches['test']['in']=data.patches['test']['in'].astype(np.float32)
-	data.patches['train']['in']=data.patches['train']['in'].astype(np.float32)		
-	deb.prints(data.patches['val']['label'].shape)
-	#=========== Hannover
+	#=========== End of moving bcknd label from 0 to last value
 
 	metrics=['accuracy']
 	#metrics=['accuracy',fmeasure,categorical_accuracy]
-	model.compile(loss='binary_crossentropy',
-				  optimizer=adam, metrics=metrics,loss_weights=model.loss_weights)
+
+
+	#loss=weighted_categorical_crossentropy_ignoring_last_label(model.loss_weights)
+	loss=categorical_focal_ignoring_last_label(alpha=0.25,gamma=2)
+	#loss=weighted_categorical_focal_ignoring_last_label(model.loss_weights,alpha=0.25,gamma=2)
+
+	model.graph.compile(loss=loss,
+				  optimizer=adam, metrics=metrics)
 	model_load=False
 	if model_load:
 		model=load_model('/home/lvc/Documents/Jorg/sbsr/fcn_model/results/seq2_true_norm/models/model_1000.h5')
 		model.test(data)
-	
+
 	if args.debug:
 		deb.prints(np.unique(data.patches['train']['label']))
 		deb.prints(data.patches['train']['label'].shape)
+
+	#pdb.set_trace()
 	model.train(data)
