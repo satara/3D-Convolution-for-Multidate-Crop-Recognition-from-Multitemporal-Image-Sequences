@@ -11,24 +11,21 @@ Use the helper file tif_to_npy.py to convert the TIF VH and VV input image bands
 
 ## Instructions
 
-To train Campo Verde dataset and BUnetConvLSTM network:
+The script networks/convlstm_networks/train_src/main.py is used to train the networks, with the following options:
 
-1. Copy the sequence of input images in "dataset/dataset/cv_data/in_np2/" folder. Rename the input images as 'inX.npy', where X is an integer representing the image ID in the sequence.
-2. Copy the sequence of output label images in "dataset/dataset/cv_data/labels/" folder. Rename the label images as 'X.tif', where X is an integer representing the image ID in the sequence.
-3. Execute "cd networks/convlstm_networks/train_src/scripts/"
-4. Execute ". experiment_automation_lv2.sh"
+1. "dataset" will select the dataset with "cv" for Campo Verde and "lem" for LEM
+2. "args.model_type" will select which model to use. Models used in the paper are:
 
+  * BUnet4ConvLSTM (In the paper known as Baseline)
+  * BUnet4ConvLSTM_SkipLSTM (In the paper known as BConvLSTM_Skip)
+  * Unet3D (In the paper known as Unet3D)
+  * Unet3D_ATPP (In the paper known as Unet3D_ATPP)
 
-## Specify the execution order durinig training (select if you want to extract image patches and select the network)
+Parameters for each model can be set within the model delcaration. Other models present in the script were also tested in our research and can be tweaked and evaluated.
 
-The file "experiment_automation_lv2.sh" specifies the execution order during training. For example, the order could be 1. extract image patches and 2. train BUnetConvLSTM network (Default configuration).
+The script networks/convlstm_networks/train_src/analysis/analysis_fcn_journal_importantclasses2.py is used to evaluate the models, with the following options:
 
-Modify this script to train other networks: 
-  1. open the "experiment_automation_lv2.sh" script, 
-  2. In this script, change the second parameter from the "experiment_automation.sh" command, which is initially set to BUnet4ConvLSTM, to:
-
-  * ConvLSTM_seq2seq (In the paper known as UConvLSTM)
-  * ConvLSTM_seq2seq_bi (In the paper known as BConvLSTM)
-  * DenseNetTimeDistributed_128x2 (In the paper known as BDenseConvLSTM)
-  * BUnet4ConvLSTM (In the paper known as BUnetConvLSTM)
-  * BAtrousGAPConvLSTM (In the paper known as BAtrousGAPConvLSTM)
+1. "dataset" will select the dataset with "cv" for Campo Verde and "lm" for LEM
+2. "small_classes_ignore" can be set to ignore classes with few samples in any date. Further configuration can be done if this option is set to True to define specific classes to be ignored or to define a threshold for the classes to be considered, as done in the paper for Figure 12
+3. "skip_crf" can be set to turn CRF on and off with further configuration done within the "dense_crf" function
+4. "exp_id" can be set within each dataset to define the models to be analysed. For each id an "experiment_groups" can be created as an array of models with size MxN, where M is the number of different models to be evaluated and N defines number of experiments of the same model (up to five). So an array fo size 1x1 will evaluate a single model while an array of 4x5 will evaluate 4 models, each with 5 experiments.
