@@ -21,7 +21,7 @@ The script networks/convlstm_networks/train_src/main.py is used to train the net
   * Unet3D (In the paper known as Unet3D)
   * Unet3D_ATPP (In the paper known as Unet3D_ATPP)
 
-Parameters for each model can be set within the model delcaration. Other models present in the script were also tested in our research and can be tweaked and evaluated.
+Parameters for each model can be set within the model declaration. Other models present in the script were also tested in our research and can be tweaked and evaluated.
 
 The script networks/convlstm_networks/train_src/analysis/analysis_fcn_journal_importantclasses2.py is used to evaluate the models (Figure 7-13 in the paper), with the following options:
 
